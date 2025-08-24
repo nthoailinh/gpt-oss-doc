@@ -1,0 +1,39 @@
+  Data/Weight Loading Mechanism
+
+  Binary Format Loading:
+  - Uses custom .bin format, not mf4 format (no mf4 references found)
+  - Weights are loaded via load_checkpoint() in run.cpp:249-296
+  - Uses memory mapping (mmap) for efficient weight loading
+  - Config header is read first using fread(), then weights are memory-mapped
+
+  Loading Process:
+  1. build_transformer() calls load_checkpoint()
+  2. Config struct (15 parameters) read with fread()
+  3. File memory-mapped with mmap() for weight access
+  4. memory_map_weights() sets up pointers to different weight sections
+
+  Weight Organization
+
+  Weights are organized in specific order in the binary file:
+  - Token embeddings
+  - Output/unembedding weights
+  - Layer norm weights (RMSNorm)
+  - Attention weights (QKV, output)
+  - MoE router weights
+  - MLP weights for each expert
+
+  Precision Usage
+
+  FP32 (float32) Only:
+  - All computations use float (32-bit) precision
+  - All weight pointers are float*
+  - Memory allocation uses sizeof(float)
+  - No fp16/half-precision found in the C++ inference code
+
+  Weight Export (generate_bin.py):
+  - Supports both float32 and bfloat16 for weight storage
+  - np_dtype = np.float32 if dtype == "float32" else np.bfloat16
+  - Default appears to be float32 for inference compatibility
+
+  The code uses a straightforward fp32-only inference engine with efficient memory-mapped
+  weight loading from a custom binary format, not mf4.

@@ -1,0 +1,24 @@
+  Key Weight Tensors (in order of size):
+
+  1. MLP weights (MoE) - w_mlp1: (n_layers * n_experts * 2 * intermediate_dim * hidden_dim)
+  2. MLP weights (MoE) - w_mlp2: (n_layers * n_experts * hidden_dim * intermediate_dim)
+  3. Token embeddings - token_embedding_table: (vocab_size * hidden_dim)
+  4. Output weights - out: (vocab_size * hidden_dim)
+  5. Attention QKV - w_qkv: (n_layers * hidden_dim * (head_dim * n_attn_heads + 2 * head_dim * 
+  n_kv_heads))
+  6. Attention output - w_o: (n_layers * (head_dim * n_attn_heads) * hidden_dim)
+
+  The MLP weights (w_mlp1 and w_mlp2) take the largest volume because:
+
+  - w_mlp1: n_layers × n_experts × 2 × intermediate_dim × hidden_dim parameters
+  - w_mlp2: n_layers × n_experts × hidden_dim × intermediate_dim parameters
+
+  Combined MLP weight count: n_layers × n_experts × 3 × intermediate_dim × hidden_dim
+
+  For typical MoE models:
+  - If n_experts = 8, n_layers = 32, intermediate_dim = 14336, hidden_dim = 4096
+  - MLP weights ≈ 32 × 8 × 3 × 14336 × 4096 ≈ 358 billion parameters
+  - Token embeddings ≈ vocab_size × hidden_dim ≈ 200k × 4096 ≈ 819 million parameters
+
+  The MoE MLP weights (w_mlp1 + w_mlp2) dominate the model size, typically accounting for
+  80-90% of total parameters in MoE architectures.
