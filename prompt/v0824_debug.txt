@@ -1,0 +1,64 @@
+Context / Problem
+
+* I ported getp to HIP (GPU) and integrated forward\_hip(). It compiles and runs on the 7M model, but GPU logits don’t match CPU golden logits and throughput regressed.
+* Checker result: mismatch at element 2011 (GPU −7.29879e−02 vs CPU −3.34332e−03; atol=1e−6, rtol=1e−5).
+* Runtime note: current code does D2H inside the MoE loop (reading top-k index/weight per expert), and calls softmax per head in a loop.
+
+Goal
+
+* Achieve strict CPU↔GPU parity (checker passes) while keeping the correctness-first baseline. Then remove obvious sync points (D2H in inner loops) to recover baseline speed.
+
+What to do (step by step; edit getp\_run.cpp only)
+
+1. Add a one-shot CPU↔GPU parity tracer to locate the first divergence
+
+* Add a PARITY\_CHECK guard (env or #define). For a single token/pos=0, dump intermediate tensors on both CPU and GPU and compare them to find the earliest layer/op where they diverge.
+* Add helpers: dump\_device(path, d\_ptr, n) and dump\_host(path, h\_ptr, n). CSV or simple txt lines are fine.
+* Dump (in order): embedding row (x), attn rmsnorm(t), qkv proj (qkv), split(q,k,v), q after RoPE, k after RoPE, att scores before softmax (per head for 0..pos and sink slot), att after softmax, tb, attn out proj(tb2), x after residual, ffn rmsnorm(t), router\_score, topk\_i, topk\_v (before softmax), mlp1\_out, split(gate, up), swiglu(gate\_up), mlp2(tb2), e\_agg, x after FFN, final rms t, logits.
+* On the CPU side call the existing run.cpp path to produce the same checkpoints for the same token/pos. Compare max abs/rel diffs and print the first stage that fails.
+
+2. Fix likely root causes (mirror run.cpp exactly; no guessed constants)
+
+* SwiGLU kernel:
+  • Clamp both directions for gate and up exactly like run.cpp: val = clamp(val, -limit, +limit); up\_val = clamp(up\_val, -limit, +limit). Your current code clamps gate only on + side. Fix that.
+  • Confirm the “+1.0” in the up branch. Only apply (up\_val + 1.0f) if run.cpp does it. If not, remove it. Make the math and order identical to run.cpp (alpha=1.702 for SiLU(ax), i.e., val *= 1/(1+exp(-alpha*val))).
+* RoPE:
+  • Do not hardcode NTK/YaRN constants. Read the exact values/branches from run.cpp/Config and reproduce identical formulas, rotary\_dim handling, and any scaling gates. If run.cpp rotates only rotary\_dim (not full head\_dim), respect that and leave the tail unrotated.
+  • Verify frequency computation and positional argument order. If run.cpp precomputes cos/sin or uses rsqrt/exp order, match it.
+* Attention mask & sink:
+  • Verify mask indexing strictly matches run.cpp (row/col). If your kernel uses d\_mask\[pos*seq\_len + t] but CPU uses t*seq\_len + pos (or vice versa), fix it.
+  • Confirm the sink slot index (pos+1) and whether sink contributes to value mixing (many models: sink is excluded from V mixing). Make your GPU path exactly the same.
+* GEMV shapes/layout:
+  • Re-check all shapes and row-major indexing against run.cpp:
+
+  * W\_qkv: \[qkv\_out, hidden\_dim]
+  * W\_o:   \[hidden\_dim, head\_dim\*n\_attn\_heads] or \[out, in] as used in your kernel
+  * W\_router: \[n\_experts, hidden\_dim]
+  * W\_mlp1: \[2\*intermediate\_dim, hidden\_dim]
+  * W\_mlp2: \[hidden\_dim, intermediate\_dim]
+  * W\_out: \[vocab\_size, hidden\_dim]
+    • Ensure launch\_gemv(\_bias)\_fp32 and launch\_gemv(\_bias)\_bf16fp32 are invoked with (out\_features, in\_features) matching that exact row-major layout. Any hidden transpose here will cause parity drift.
+* BF16 conversions:
+  • Confirm fp32\_to\_bf16 uses round-to-nearest-even and bf16\_to\_fp32 reconstructs by zero-filling the lower 16 bits. No fast-math.
+* Softmax length:
+  • Ensure the length passed is exactly (pos+2): tokens \[0..pos] plus the sink at pos+1. Verify you’re not softmaxing over full seq\_len.
+
+3. Remove obvious performance sinks without changing numerics
+
+* Eliminate D2H inside the MoE loop. Read topk\_i and topk\_v once (two hipMemcpyDtoH calls) before looping, or better, write a tiny device kernel that reads indices/weights from device and launches the two GEMVs + accumulate on device with no host sync in between.
+* Keep one softmax launch per head for now (correctness-first), but consider a kernel that softmaxes all heads in one pass once parity is green.
+
+4. Warnings and hygiene
+
+* hipHostFree/hipDeviceSynchronize/hipFree return values are \[\[nodiscard]] on some compilers; either HIP\_CHECK them or cast to (void) to silence warnings.
+* Do not introduce fast-math flags; keep FP32 order identical to CPU.
+
+5. Acceptance criteria
+
+* After fixes, run one token through forward\_hip, write data/logits.txt from GPU, and verify with:
+  ./checker data/logits.txt data/logits\_7m\_ans.txt
+  The checker must pass (no mismatches) at atol=1e-6, rtol=1e-5.
+* Print the first failing stage (if any) from the parity tracer until it’s green.
+* Re-run the original getp workflow and report tokens/sec; removing the D2H in MoE should materially improve throughput.
+
+Please implement the parity tracer first, identify the earliest divergent stage, fix it, and iterate until checker passes. Then remove the D2H in MoE and share an updated timing summary.

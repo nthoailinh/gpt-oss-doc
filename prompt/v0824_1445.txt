@@ -1,0 +1,117 @@
+You are a senior GPU Systems Engineer (ROCm/HIP, MI250). Please convert our getp mode to a correctness‑first HIP GPU baseline. Do NOT optimize yet; just move CPU compute to HIP kernels with identical math/logic and verify parity. Very important constraints and instructions below — follow them exactly.
+
+Repository / scope
+
+* Do not change the CLI or evaluation flow. Keep `run.cpp`, `getp_eval.cpp`, and `Makefile` behavior unchanged.
+* Implement everything ONLY inside `getp_run.cpp`. Do not create new files or headers.
+* Target AMD MI250 (gfx90a). Use HIP (`hip/hip_runtime.h`) only. No rocBLAS/MIOpen or other libraries.
+* Sampling stays on CPU; copy logits back to host each step in decode.
+* Numerics: compute in FP32 end‑to‑end except the on‑device storage format for two MoE tensors as BF16 (details below).
+
+Model / code context (use run.cpp as the single source of truth for logic)
+
+* The C CPU reference implementation is in `run.cpp`. Mirror its math and control flow exactly: tokenizer usage, forward pass structure, attention, MoE, RMSNorm, RoPE, router top‑k, SwiGLU, residuals, final matmul into logits, etc.
+* Weight memory layout/order is defined by `memory_map_weights()` in `run.cpp`. Preserve the exact shapes and indexing.
+
+Your tasks (baseline HIP port)
+
+1. File scaffolding (in `getp_run.cpp` only)
+
+   * Include `hip/hip_runtime.h` and any minimal helpers you need (inline device functions) inside this file.
+   * Add a small RAII‑style struct or plain C functions in this file to handle device allocations/frees and host↔device copies.
+
+2. Device buffers
+
+   * Create a `DeviceState` in `getp_run.cpp` (do not modify other files) that holds device copies of:
+     • All weights from `TransformerWeights`, except:
+     – MoE tensors `w_mlp1` and `w_mlp2` must be stored on device in BF16 (see #3).
+     • All per‑token/step activations from `RunState` needed on device for forward pass (x, t, tb, tb2, qkv, q, k, v, att, key\_cache, value\_cache, logits, etc.).
+   * Allocate KV caches on device in FP32 with the same shape as CPU reference.
+
+3. Special weight storage requirement (20B model memory fit)
+
+   * On host, weights are memory‑mapped as FP32 (per `load_checkpoint()`).
+   * When uploading to GPU:
+     • Store MoE MLP weights `w_mlp1` and `w_mlp2` in BF16 on device to reduce memory. Everything else remains FP32 on device.
+     • Convert FP32→BF16 during HtoD copy for `w_mlp1`/`w_mlp2`. Implement a portable BF16 type in this file (e.g., `struct bf16 { uint16_t x; };`) and conversion helpers:
+     – `__host__ __device__ inline bf16 f32_to_bf16(float)`
+     – `__host__ __device__ inline float bf16_to_f32(bf16)`
+     • During compute, always upcast BF16 weights to FP32 before FMA. For matmuls that read `w_mlp1`/`w_mlp2`, implement BF16×BF16→FP32 multiply‑accumulate (i.e., load BF16, upcast both multiplicands to float, accumulate in float).
+     • No mixed‑precision accumulators: accumulations are FP32.
+
+4. Kernelization (1:1 logic with CPU)
+   Implement HIP kernels that mirror the CPU functions in `run.cpp`:
+
+   * `rmsnorm`: same formula, FP32 accumulation.
+   * `softmax`: per‑row max, subtract, exp, sum, divide (FP32). Scope only as needed (attention scores and top‑k expert probs).
+   * `matmul`: baseline FP32 GEMV (W\[out,in] @ x\[in] → y\[out]). Implement two code paths:
+     • Generic FP32 (for all FP32‑stored weights).
+     • Specialized path for MoE MLP using device BF16 weights with FP32 compute (BF16 load + upcast).
+   * QKV projection: a kernel that computes `qkv = W_qkv * t + b_qkv` then splits into q, k, v buffers. Shapes are exactly as in `run.cpp`.
+   * RoPE: implement helpers to compute cos/sin (you may precompute on host or compute per step on device; keep math identical). Then a kernel `apply_rotary_emb` for q and k.
+   * Attention:
+     • Compute dot(q, K\_cache\[0..pos]) / sqrt(head\_dim) per head, apply optional sliding window mask (match `run.cpp` exactly), append sink score, softmax over length (pos+2).
+     • Weighted sum over V\_cache to produce per‑head outputs into `tb`.
+     • Final projection `W_o * tb + b_o` to `tb2`.
+   * Router (MoE):
+     • Router score: `w_router * t + b_router` on device, FP32.
+     • Top‑k selection on device (k = `experts_per_token`). Implement a simple partial selection or sort kernel; correctness first.
+     • Softmax over selected top‑k scores on device.
+     • For each selected expert e:
+     – `mlp1_out = (w_mlp1[e] * t) + b_mlp1[e]`, then split into `gate` and `up` (even/odd), clamp as in `run.cpp`, SiLU with alpha=1.702, add bias +1.0 to `up`, elementwise multiply to make `gate_up`.
+     – `tb2 = (w_mlp2[e] * gate_up) + b_mlp2[e]`.
+     – Aggregate into `e_agg += expert_weight * tb2`.
+     • Residual add back to `x` after attention and after MoE, exactly like CPU.
+   * Final RMSNorm and final matmul into `logits`.
+
+5. getp control flow wiring
+
+   * Keep `getp_eval.cpp` as is. Implement these functions in `getp_run.cpp`:
+     • `warm_up(Transformer*, Tokenizer*)`: allocate/initialize all device buffers, upload all weights with required formats (BF16 for MoE weights, FP32 for others), zero caches, and run a tiny forward dry‑run if helpful.
+     • `inference(Transformer*, Tokenizer*, Sampler*, Requests*)`: for each request line:
+     – Encode on CPU (unchanged).
+     – For each token position:
+     · Launch forward pass on device (kernels above) using device KV cache.
+     · Copy `logits` for this step back to host (pinned host buffer recommended but not required for baseline).
+     · Run sampling on CPU (unchanged).
+     · Stop early on EOS per reference logic.
+     – Write generated token IDs into `Requests.tok_gens`.
+     • `finish(Transformer*, Tokenizer*)`: free all device buffers.
+
+6. Parity & determinism
+
+   * Preserve the exact math order as in `run.cpp`. Avoid re‑associating sums.
+   * Use FP32 for reductions. No fast‑math flags. No fused optimizations.
+   * After implementing, add a basic self‑check inside `inference` for the first request and first few steps:
+     • Run the same step once on CPU (`forward()` from `run.cpp`) and once on GPU, compare `logits` elementwise on host with tolerance (abs ≤ 1e‑4, rel ≤ 1e‑4). Log the max diff once per run.
+     • Compare sampled token IDs against CPU path for a short prefix if temperature=0.0.
+
+7. Practical notes
+
+   * Assume single‑GPU MI250. No multi‑GPU or multi‑node code here.
+   * Use simple 1D/2D grids; correctness over speed. Reasonable choices:
+     • GEMV: one thread per output element, inner loop over `n`.
+     • Reductions: warp/block reductions with shared memory if needed, but simple global atomics are acceptable for baseline if correctness is maintained.
+   * Use `hipMemcpy` / `hipMalloc` / `hipFree`, and check return codes. Minimal `HIP_CHECK` macro is fine (define locally in this file).
+   * Use pinned host memory only if trivial to add; not required for baseline.
+
+8. Things you must not do
+
+   * Do not change `run.cpp`, `getp_eval.cpp`, `Makefile`, or tokenizer files.
+   * Do not add new source files or headers. Everything lives in `getp_run.cpp`.
+   * Do not introduce any third‑party or ROCm math libraries.
+   * Do not change sampling logic or CLI.
+
+What to deliver (in getp\_run.cpp only)
+
+* A complete, compilable HIP baseline that replaces CPU compute in getp with GPU kernels, honoring BF16 storage for `w_mlp1`/`w_mlp2` and FP32 compute everywhere.
+* Device state setup/teardown, forward pass kernels, host↔device copies for logits per step, and the warm\_up/inference/finish functions wired to `getp_eval.cpp`.
+* Minimal comments explaining kernel grid/block mapping and BF16 conversion.
+* A small runtime parity check (see #6) gated so it runs once per process.
+
+Acceptance criteria
+
+* Builds with the existing Makefile on MI250.
+* For a fixed prompt with temperature=0, first N generated tokens match CPU (or logits within 1e‑5 tolerances leading to identical greedy tokens).
+* Memory footprint fits in ≤64 GB/GPU for the 20B model due to BF16 storage of MoE weights.
+* No new files introduced; only `getp_run.cpp` changed.

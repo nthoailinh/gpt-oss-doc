@@ -1,0 +1,125 @@
+You are a senior GPU Engineer (ROCm/HIP, MI250). I need you to port the gpt-oss “getp” mode to a correctness-first GPU HIP baseline using multiple small patches. Keep the CLI and evaluation flow unchanged. Do not optimize yet; just convert CPU compute to HIP kernels with identical math/logic and verify parity.
+
+Repository constraints
+
+* Do NOT modify: run.cpp, getp\_eval.cpp, Makefile.
+* You MAY add new files and implement GPU path in getp-csrc/getp\_run.cpp and new hip/\* sources.
+* Sampling remains on CPU; copy logits back to host each step.
+* Target GPUs: AMD MI250 (gfx90a). Use HIP only (no rocBLAS/MIOpen, no external libs).
+* Numerics: compute in FP32 by default. Special case: always store MoE MLP weights (w\_mlp1, w\_mlp2) in BF16 on device to fit 20B in <64GB per GPU; all other weights stay FP32.
+
+BF16 requirement (no toggles)
+
+* On load to GPU: convert w\_mlp1 and w\_mlp2 to BF16 (uint16\_t) and upload into dedicated device buffers. All biases remain FP32. All other weights are FP32 on device.
+* During compute: upcast BF16 → FP32 inside kernels before FMA so math in MoE MLP uses BF16xBF16 → FP32 accumulate (activations stay FP32 baseline).
+* There is NO environment flag to disable BF16. Assume BF16 for MoE is always ON.
+
+Deliver code in 7 small patches. For each patch provide: (1) exact file list/paths, (2) complete compilable code, (3) build/run command that matches our CLI, (4) a quick validation note (what to run, expected tolerance).
+
+Patch 1 — Scaffolding and stubs
+Goal: add HIP scaffolding and wire GPU entry points without changing behavior yet.
+
+* Files:
+
+  * hip/hip\_utils.h : HIP\_CHECK macro, device pick (env HIP\_DEVICE\_ID), helpers for malloc/copy/free, pinned host alloc.
+  * getp-csrc/getp\_run.cpp : implement warm\_up()/finish()/inference() wrappers that currently call the CPU forward() to keep behavior identical; add forward\_hip() stub returning CPU logits for now.
+* Build & Run:
+  make && ./run /nfs/gpu\_trainee/final-project/modelbin/gpt-oss-7m.bin -m getp -i data/input.txt -o data/output.txt
+* Validation: output identical to current baseline (no GPU math yet).
+
+Patch 2 — Device weights/state and BF16 load for MoE
+Goal: allocate GPU memory and upload weights; MoE weights stored as BF16 on device.
+
+* Files:
+
+  * hip/device\_structs.hpp : define DeviceWeights and DeviceState mirrors of TransformerWeights/RunState with device pointers.
+    • DeviceWeights: FP32 device buffers for all weights except w\_mlp1\_bf16, w\_mlp2\_bf16 (uint16\_t); biases FP32.
+    • DeviceState: x\_d, t\_d, tb\_d, tb2\_d, router\_score\_d, topk\_v\_d, topk\_i\_d, mlp1\_out\_d, gate\_d, up\_d, gate\_up\_d, e\_agg\_d, qkv\_d, q\_d, k\_d, v\_d, att\_d, logits\_d; KV caches key\_cache\_d, value\_cache\_d; mask\_d if sliding\_window > 0.
+  * hip/bf16.hpp : float↔bf16 (uint16\_t) round-to-nearest-even conversions.
+  * getp-csrc/getp\_run.cpp : in warm\_up(), memory\_map\_weights() from host; hipMalloc device buffers; upload FP32 weights; convert w\_mlp1/w\_mlp2 host FP32 → host BF16 temporary → upload to w\_mlp1\_d\_bf16 / w\_mlp2\_d\_bf16. Allocate DeviceState buffers, build sliding-window mask on host then upload.
+* Build & Run: same command.
+* Validation: smoke test loads and runs (still using forward\_hip stub), confirms memory fits for 20B thanks to BF16 MoE.
+
+Patch 3 — Elementwise kernels (RMSNorm, Softmax, Rotary apply)
+Goal: port simple per-element ops to device.
+
+* Files:
+
+  * hip/kernels/layernorm.hip : rmsnorm\_kernel(o, x, w, size) with FP32 accumulation.
+  * hip/kernels/softmax.hip : row-wise softmax\_kernel(x, row\_len) using max-reduce → exp/sum/reduce; one block per row baseline.
+  * hip/kernels/rope.hip : apply\_rotary\_emb\_kernel(x, cos, sin, n\_heads, head\_dim). cos/sin computed on host (reuse CPU functions) and uploaded per step.
+  * getp-csrc/getp\_run.cpp : thin launch wrappers.
+* Build & Run: same command.
+* Validation: unit test small vectors vs CPU for rmsnorm/softmax/rotary (max abs diff ≤ 5e-6). Forward path still CPU.
+
+Patch 4 — Matvec kernels (FP32 and BF16-weighted)
+Goal: port matmul used as matvec (W @ x) for projections.
+
+* Files:
+
+  * hip/kernels/matvec.hip :
+    • matvec\_fp32(y, x\[in], W\[out×in]) FP32 accumulate (1 block per out row).
+    • matvec\_bf16\_w\_fp32\_accum(y, x\[in FP32], W\_bf16\[out×in], convert on the fly bf16→fp32, FP32 FMA).
+  * getp-csrc/getp\_run.cpp : call matvec\_fp32 for all non‑MoE weights; call matvec\_bf16\_w\_fp32\_accum for w\_mlp1/w\_mlp2.
+* Build & Run: same command.
+* Validation: micro-tests comparing outputs vs CPU matmul (≤ 5e-5). Forward path still CPU for end-to-end.
+
+Patch 5 — Attention block on GPU
+Goal: full attention path device-side (QKV projection, KV-cache write, dot/softmax, weighted sum, WO, residual).
+
+* Files:
+
+  * hip/kernels/attention.hip :
+    • qkv\_project: sequential calls to matvec\_fp32 to compute qkv = W\_qkv @ t + b\_qkv (baseline okay).
+    • split\_qkv kernel; write\_kv\_cache kernel.
+    • attn\_scores kernel per head: q·k\_t / sqrt(head\_dim) over t∈\[0..pos], add sliding-window mask for even layers if enabled.
+    • reuse softmax kernel for (pos+2) elements (including sink).
+    • attn\_weighted\_sum kernel; then WO matvec + bias; residual x += tb2.
+  * getp-csrc/getp\_run.cpp : implement forward\_hip() attention portion: rmsnorm(t), QKV→KV cache, rotary apply (cos/sin precomputed on host), attention kernels, WO + residual.
+* Build & Run:
+  make && ./run /nfs/gpu\_trainee/final-project/modelbin/gpt-oss-7m.bin -m getp -i data/input.txt -o data/output.txt
+* Validation: switch forward() to forward\_hip() for attention path only (FFN still CPU). Compare logits after attention block vs CPU within max abs diff ≤ 5e-4 for several steps.
+
+Patch 6 — MoE on GPU with BF16 weights (always on)
+Goal: move router and expert MLPs to device; keep top‑k selection on CPU for simplicity.
+
+* Files:
+
+  * hip/kernels/router.hip : router matvec (FP32) + bias → router\_score\_d.
+  * hip/kernels/swiglu.hip : SwiGLU (alpha=1.702) with clamp ±swiglu\_limit and +1 bias on up path.
+  * getp-csrc/getp\_run.cpp :
+    • Launch router; copy router\_score\_d → host; perform top‑k on CPU; upload selected indices/weights; normalize with softmax (either host or device).
+    • For each selected expert e:
+
+    * mlp1: matvec\_bf16\_w\_fp32\_accum(mlp1\_out\_d, t\_d, w\_mlp1\_d\_bf16\[l,e], in=hidden\_dim, out=2\*intermediate\_dim) + b\_mlp1\_d\[l,e].
+    * split gate/up; swiglu kernel → gate\_up\_d.
+    * mlp2: matvec\_bf16\_w\_fp32\_accum(tb2\_d, gate\_up\_d, w\_mlp2\_d\_bf16\[l,e], in=intermediate\_dim, out=hidden\_dim) + b\_mlp2\_d\[l,e].
+    * e\_agg\_d += expert\_w \* tb2\_d.
+      • residual: x\_d += e\_agg\_d.
+* Build & Run: same command.
+* Validation: full forward\_hip end-to-end (attention + MoE) vs CPU logits:
+  general layers ≤ 5e-4; layers involving MoE can be ≤ 2e-3 due to BF16 storage. Run fixed-seed 32 decode steps and confirm token parity; if mismatch, print per-layer max-abs-diff diagnostics.
+
+Patch 7 — Cleanup, resource management
+Goal: finalize baseline quality.
+
+* Files:
+
+  * Ensure finish() frees all device allocations; guard against leaks.
+  * Add assertions for shapes/strides; check HIP\_DEVICE\_ID only.
+  * Error handling: HIP\_CHECK after every launch and memcpy.
+  * Document grid/block choices at call sites (simple 1D/2D launches).
+* Build & Run: same command.
+* Validation: run 7m (parity) and 20b (memory-fit with BF16 MoE) smoke tests; print achieved TPS from getp\_eval.
+
+General implementation notes
+
+* Keep one HIP stream (no overlap).
+* Sequence length: decode 1 token/step (no batching).
+* KV cache layout: \[layer, seq\_len, kv\_dim] identical to CPU; same indexing.
+* Rotary: compute cos/sin on host via existing CPU functions; upload per step.
+* Attention sinks: set att\[pos+1] = attn\_sinks\[l, h], then softmax over pos+2 elements.
+* Use restrict pointers and aligned accesses when easy; no micro-optimizations yet.
+* Vector types (float4/uint2) only if trivially aligned; otherwise scalar loads for baseline correctness.
+
+I will perform Build & Run and Validation remotely in the server. You only need to provide files/patches and the reasoning behind them 

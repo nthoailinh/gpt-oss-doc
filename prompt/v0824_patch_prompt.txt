@@ -1,0 +1,462 @@
+Prompt 1:
+You are a senior GPU engineer (ROCm/HIP on AMD MI250). I’m porting “getp” mode to a correctness‑first HIP baseline. Follow these hard rules for the whole session:
+
+Edit getp_run.cpp only. Do NOT add new files or headers.
+
+Keep CLI and evaluation flow unchanged. Sampling stays on CPU.
+
+Use HIP only (hip/hip_runtime.h). No rocBLAS/MIOpen.
+
+Numerics: compute FP32 everywhere. Store only MoE MLP weights (w_mlp1, w_mlp2) in BF16 on device; all other weights FP32. When multiplying with BF16 weights, load BF16, upcast to FP32, and accumulate in FP32.
+Acknowledge these rules and restate them in your own words so we’re aligned.
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Prompt 2:
+Open getp_run.cpp and add minimal HIP scaffolding:
+- Include hip/hip_runtime.h.
+- Define HIP_CHECK macro.
+- Define bf16 type like this:
+typedef struct __align__ (2) {
+    uint16_t x;
+} bf16_t;
+- Add conversion helpers with these exact signatures and semantics (host+device, inline, round-to-nearest-even on down-convert). 
+host device inline bf16_t fp32_to_bf16(float f); // used during host upload or device-side bulk conversion
+device forceinline float bf16_to_fp32(bf16_t h); // used only in device compute
+You may use this code:
+#include <stdint.h>
+#include <string.h>
+
+typedef struct __align__(2) { uint16_t x; } bf16_t;
+
+__host__ __device__ inline bf16_t fp32_to_bf16(float f) {
+  // RNE: add 0x7FFF + LSB of upper 16 bits
+  uint32_t u;
+  memcpy(&u, &f, sizeof(u));
+  uint32_t lsb = (u >> 16) & 1u;
+  uint32_t rounded = u + 0x7FFFu + lsb;
+  bf16_t h;
+  h.x = (uint16_t)(rounded >> 16);
+  return h;
+}
+
+__device__ __forceinline__ float bf16_to_fp32(bf16_t h) {
+  uint32_t u = ((uint32_t)h.x) << 16;
+  float f;
+  memcpy(&f, &u, sizeof(f));
+  return f;
+}
+- Declare (declare only; no allocation yet) all device pointers as file-scope static globals (not in a struct). Use clear names and types. We will allocate in warm\_up():
+  // FP32 weights on device
+  static float\* d\_token\_embedding\_table\_fp32;
+  static float\* d\_out\_fp32;
+  static float\* d\_rms\_attn\_w\_fp32;
+  static float\* d\_rms\_ffn\_w\_fp32;
+  static float\* d\_rms\_out\_w\_fp32;
+  static float\* d\_w\_qkv\_fp32;
+  static float\* d\_b\_qkv\_fp32;
+  static float\* d\_w\_o\_fp32;
+  static float\* d\_b\_o\_fp32;
+  static float\* d\_attn\_sinks\_fp32;
+  static float\* d\_w\_router\_fp32;
+  static float\* d\_b\_router\_fp32;
+  // BF16 MoE MLP weights on device (storage), biases remain FP32
+  static bf16\_t\* d\_w\_mlp1\_bf16;  // (n\_layers, n\_experts, 2*intermediate\_dim, hidden\_dim)
+  static bf16\_t* d\_w\_mlp2\_bf16;  // (n\_layers, n\_experts, hidden\_dim, intermediate\_dim)
+  static float\*  d\_b\_mlp1\_fp32;
+  static float\*  d\_b\_mlp2\_fp32;
+  // Activations / scratch (FP32)
+  static float\* d\_x;
+  static float\* d\_t;
+  static float\* d\_tb;
+  static float\* d\_tb2;
+  static float\* d\_router\_score;
+  static float\* d\_topk\_v;
+  static int\*   d\_topk\_i;
+  static float\* d\_mlp1\_out;
+  static float\* d\_gate;
+  static float\* d\_up;
+  static float\* d\_gate\_up;
+  static float\* d\_e\_agg;
+  static float\* d\_qkv;
+  static float\* d\_q;
+  static float\* d\_k;    // per-step K before writing to cache
+  static float\* d\_v;    // per-step V before writing to cache
+  static float\* d\_att;
+  static float\* d\_logits;
+  // KV caches + mask (FP32)
+  static float\* d\_key\_cache;
+  static float\* d\_value\_cache;
+  static float\* d\_mask; // only if sliding\_window > 0
+* Do not allocate or copy any memory in this step. Just add the includes, the HIP\_CHECK macro, the bf16\_t type and the two conversion helpers, and declare the global device pointers. Leave all existing logic untouched.
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Prompt 3 — Warmup() allocations and weight upload
+
+You are still editing getp\_run.cpp only. Implement warm\_up(Transformer\*, Tokenizer\*) as a correctness-first initializer. Do not touch inference/sampling. Tasks:
+
+* Read model Config from Transformer (as defined in run.cpp) and compute exact element counts for all tensors (weights, activations, KV caches, logits) using size\_t. Respect the existing memory layout and shapes from run.cpp.
+* hipMalloc all previously declared device pointers (weights FP32, MoE MLP weights as BF16 storage, biases FP32, activations/scratch FP32, KV caches FP32). If sliding\_window>0, allocate mask; otherwise keep it null. Make the function idempotent (skip if already allocated).
+* Zero-init KV caches and scratch/activations with hipMemsetAsync (or hipMemset).
+* Upload weights from the host TransformerWeights:
+  • For FP32 weights/biases: HIP\_CHECK(hipMemcpy(…, hipMemcpyHostToDevice)).
+  • For MoE MLP weights (w\_mlp1, w\_mlp2): convert host FP32 → BF16 on the host using fp32\_to\_bf16 in a simple for-loop; then copy the BF16 array to device. (Optional: use hipHostMalloc for a pinned staging buffer; free it after copy.) Biases remain FP32 and are copied normally.
+  • Do not change order/strides; follow the same contiguous layout as memory\_map\_weights in run.cpp.
+* Upload any constant buffers used by attention (e.g., attn\_sinks) to device as FP32.
+* Use HIP\_CHECK around all allocations/memcpy/memset; set all device pointers to nullptr on failure before returning.
+* No behavior changes beyond allocation/upload; no kernels beyond a possible trivial host-side conversion loop; no logging except minimal error prints.
+
+Prompt 4 — finish(): teardown
+
+You are still editing getp\_run.cpp only. Implement finish(Transformer\*, Tokenizer\*) as a safe, idempotent teardown. Tasks:
+
+* Do not modify Transformer/Tokenizer or any CPU weights. Only free device resources created in warm\_up.
+* hipDeviceSynchronize() once at the start.
+* For every file-scope device pointer you declared, if it is non-null: hipFree(ptr) and immediately set it to nullptr. Make this safe to call multiple times (no double-free). Optional: wrap with a tiny FREE\_IF(ptr) helper.
+* If any pinned host staging buffers were introduced in warm\_up, release them with hipHostFree and null them (skip if none).
+* No other side effects: do not reset the device globally (no hipDeviceReset), do not change inference/sampling code, no logging beyond minimal error prints via HIP\_CHECK (or check hipFree return codes and continue).
+* Return void; leave the program in a clean state so warm\_up() can be called again later without leaks.
+
+Prompt 5 — FP32 building-block kernels: rmsnorm and softmax
+
+You are still editing getp\_run.cpp only. Add correctness-first HIP kernels and thin host launchers. Tasks:
+
+* Implement RMSNorm (FP32):
+  • Kernel computes mean(x^2) over a 1D vector length hidden\_dim, then scale = rsqrtf(mean + eps). Use eps from config if available; otherwise 1e-5.
+  • Output: out\[i] = x\[i] \* scale \* weight\[i], FP32 throughout.
+  • Use a simple block reduction in shared memory; grid-stride loops are fine. No re-association beyond what’s needed for reduction; avoid fast-math.
+
+* Implement Softmax (FP32, in-place):
+  • Kernel operates over a 1D vector length n. Compute max, subtract, expf, sum, divide — numerically stable path.
+  • In-place writeback to the same buffer (x). Use block reduction in shared memory; grid-stride loops OK. No fast-math.
+
+* Provide thin C wrappers (no streams, default stream only):
+  void launch\_rmsnorm\_fp32(float\* out, const float\* x, const float\* w, int hidden\_dim);
+  void launch\_softmax\_inplace\_fp32(float\* x, int n);
+
+* Use HIP\_CHECK after kernel launches (hipGetLastError()). Do not integrate into forward yet; just add kernels + wrappers with internal comments on grid/block and assumptions.
+
+Prompt 6 — Matmul (GEMV) kernels: FP32 path
+
+You are still editing getp\_run.cpp only. Add correctness-first FP32 GEMV (row-major) kernels and thin host launchers. Tasks:
+
+* Implement a baseline GEMV kernel that computes y = W\[out,in] @ x\[in] with exact row-major indexing and deterministic FP32 accumulation order:
+  for i in \[0..out): sum = 0; for j in \[0..in): sum += W\[i\*in + j] \* x\[j]; y\[i] = sum.
+  No tiling, no shared memory, no re-association, no fast-math.
+
+* Provide a variant that adds bias: y\[i] = sum + b\[i].
+
+* Each thread handles one output row (with optional grid-stride over rows). Choose a simple 1D launch: blockDim=256, gridDim=ceil\_div(out, blockDim). Add a local CEIL\_DIV macro if missing.
+
+* Mark pointers as const where applicable; keep everything FP32.
+
+* Add thin wrappers (default stream, HIP\_CHECK after launch):
+  void launch\_gemv\_fp32(float\* y, const float\* x, const float\* W, int out\_features, int in\_features);
+  void launch\_gemv\_bias\_fp32(float\* y, const float\* x, const float\* W, const float\* b, int out\_features, int in\_features);
+
+* Do not integrate into forward yet; just add kernels + wrappers with brief comments on layout and launch config.
+
+Prompt 7 — Matmul (GEMV) kernels: BF16→FP32 path for MoE
+
+You are still editing getp\_run.cpp only. Add correctness-first GEMV kernels that read BF16 weights from device and accumulate in FP32. Tasks:
+
+* Implement a baseline GEMV kernel that computes y = W\_bf16\[out,in] @ x\_fp32\[in] with exact row-major indexing:
+  • For each output row i: sum = 0; for j in \[0..in): sum += (bf16\_to\_fp32(W\_bf16\[i*in + j])) \* x\_fp32\[j]; y\[i] = sum.
+  • Deterministic FP32 accumulation order; no tiling/shared memory/fast-math.
+  • Works generically for both MoE MLP1 (out=2*intermediate\_dim, in=hidden\_dim) and MLP2 (out=hidden\_dim, in=intermediate\_dim).
+
+* Provide a bias variant: y\[i] = sum + b\_fp32\[i] (bias is FP32).
+
+* Launch config identical to FP32 path: 1D kernel, blockDim=256, gridDim=CEIL\_DIV(out\_features, 256). Use default stream and HIP\_CHECK after launch.
+
+* Add thin wrappers:
+  void launch\_gemv\_bf16fp32(float\* y, const float\* x\_fp32, const bf16\_t\* W\_bf16, int out\_features, int in\_features);
+  void launch\_gemv\_bias\_bf16fp32(float\* y, const float\* x\_fp32, const bf16\_t\* W\_bf16, const float\* b\_fp32, int out\_features, int in\_features);
+
+* Assume the caller passes W\_bf16 already offset to the correct expert/layer slice; kernels should not compute offsets internally.
+
+* Keep everything correctness-first; no integration into forward yet.
+
+Prompt 8 — QKV projection + bias + split (+ stage KV)
+
+Edit getp\_run.cpp only. Add a correctness-first device implementation for the QKV step per layer/pos. Tasks:
+
+* Implement a host helper (e.g., do\_qkv\_qkvproj\_split(layer, pos, t\_dev)) that:
+  • Uses launch\_gemv\_bias\_fp32 to compute y\_qkv = W\_qkv\[layer] @ t + b\_qkv\[layer] on device into a temporary qkv buffer (size = head\_dim*n\_attn\_heads + 2*head\_dim\*n\_kv\_heads).
+  • Splits y\_qkv into contiguous q, k, v via a simple D2D kernel (split\_qkv\_kernel) that copies 3 segments into d\_q, d\_k, d\_v.
+
+* Do not apply RoPE here (next prompt). Leave d\_q and d\_k as raw (unrotated).
+
+* Write V to KV cache now (V is not affected by RoPE): compute the offset for (layer, pos) exactly matching run.cpp layout (kv\_dim = head\_dim\*n\_kv\_heads), then D2D copy from d\_v into d\_value\_cache at that slice.
+
+* Stage K for later write: do not write K to key\_cache in this step. We will apply RoPE and write K in the next prompt.
+
+* Keep default stream, simple 1D launch (blockDim=256) for the split kernel; CEIL\_DIV for grid size. Add HIP\_CHECK after each launch/memcpy. No changes to inference() yet.
+
+Prompt 9 — RoPE helpers and application (+ commit K to cache)
+
+Edit getp\_run.cpp only. Add correctness-first RoPE for Q and K, then write K to key\_cache. Tasks:
+
+* Mirror run.cpp math exactly (same constants/fields from Config: rotary base/theta, scaling/NTK/YaRN factors if present, rotary\_dim vs full head\_dim, interleaved even/odd pairs). No fast-math; FP32 throughout.
+
+* Add a simple device kernel apply\_rope\_qk\_kernel that:
+  • For all attn heads (Q) and kv heads (K), for each pair (even, odd) in the rotary\_dim, compute cos/sin for the given pos and rotate in-place:
+  q0’ =  q0 \* cos − q1 \* sin;  q1’ = q1 \* cos + q0 \* sin
+  k0’ =  k0 \* cos − k1 \* sin;  k1’ = k1 \* cos + k0 \* sin
+  • Leave any non-rotary tail dims (if rotary\_dim < head\_dim) untouched.
+  • Use a simple 1D/2D mapping (e.g., one thread per (head, dim\_pair)).
+
+* Add a thin host helper do\_rope\_and\_commit\_k(layer, pos, Config\*):
+  • Launch apply\_rope\_qk\_kernel on d\_q and d\_k with (head\_dim, n\_attn\_heads, n\_kv\_heads, rotary\_dim, pos, and rope constants read from Config exactly as in run.cpp).
+  • After rotation, write K to key\_cache at the exact slice (layer, pos) matching run.cpp’s layout (kv\_dim = head\_dim \* n\_kv\_heads) via hipMemcpyDeviceToDevice.
+
+* Keep default stream; use CEIL\_DIV for launch sizes; HIP\_CHECK after launches and copies. No changes to other logic yet.
+
+Prompt 10 — Attention: scores, mask, sink, softmax, value mix
+
+Edit getp\_run.cpp only. Implement correctness-first attention per layer/pos. Tasks:
+
+* For each attention head h, compute scores\[t] = (q\_h · K\_cache\[t, kv\_head(h)]) \* (1/√head\_dim) for t ∈ \[0..pos], where kv\_head(h) follows the exact mapping in run.cpp (e.g., h % n\_kv\_heads). Use FP32 and the same memory layout/strides as run.cpp.
+
+* If sliding\_window > 0 and the layer requires it (match run.cpp condition, e.g., layer%2==0), add the corresponding mask value to scores\[t] exactly like CPU.
+
+* Append the extra “sink” logit at index pos+1 using the per-head constant from attn\_sinks (same math and indexing as run.cpp). The scores buffer length becomes (pos+2).
+
+* Run your existing FP32 softmax in place over length (pos+2).
+
+* Compute the weighted sum over V\_cache for t ∈ \[0..pos] (follow run.cpp precisely; if sink does not contribute to V mixing, mirror that behavior). Produce the concatenated per-head output into tb (size = n\_attn\_heads\*head\_dim), matching run.cpp head ordering.
+
+* Provide simple device kernels (scores, add\_mask\_sink, value\_mix) with 1D/2D launches and CEIL\_DIV grid sizing; default stream; HIP\_CHECK after each launch. Keep math order identical to CPU, no fast-math, no fusing.
+
+* Wrap this into a small host helper (e.g., do\_attention\_layer(layer, pos, Config\*)) that:
+
+  1. computes scores,
+  2. applies mask+sink,
+  3. calls launch\_softmax\_inplace\_fp32,
+  4. computes value mix into tb.
+
+Prompt 11 — Attention output projection + residual
+
+Edit getp\_run.cpp only. Implement the post-attention projection and residual, correctness-first. Tasks:
+
+* Use your FP32 GEMV+bias to compute tb2 = W\_o\[layer] @ tb + b\_o\[layer] on device. Respect exact row-major layout and per-layer offsets (same as run.cpp). in\_features = head\_dim \* n\_attn\_heads; out\_features = hidden\_dim.
+
+* Add a tiny elementwise kernel (1D, CEIL\_DIV, blockDim=256) to do the residual update in place: x\[i] += tb2\[i] for i in \[0..hidden\_dim). FP32 only, default stream, HIP\_CHECK after launch.
+
+* Wrap into a host helper (e.g., do\_attn\_out\_and\_residual(layer, Config\*)) that:
+
+  1. computes the projection into tb2 with launch\_gemv\_bias\_fp32,
+  2. launches the residual add kernel to update x.
+
+* No fusing, no fast-math, no changes elsewhere. Keep math/order identical to CPU.
+
+Prompt 12 — FFN rmsnorm + Router top-k (on device)
+
+Edit getp\_run.cpp only. Implement the FFN pre-norm and router gating on GPU. Tasks:
+
+* FFN rmsnorm: use your RMSNorm kernel to compute t = RMSNorm(x, rms\_ffn\_w\[layer]) in FP32. No fusing.
+
+* Router scores: compute router\_score = W\_router\[layer] @ t + b\_router\[layer] on device using your FP32 GEMV+bias (length = n\_experts). Exact row-major offsets as in run.cpp.
+
+* Top-k selection: implement a simple correctness-first device kernel that selects the top experts\_per\_token scores:
+  • One vector (router\_score) → produce two outputs: topk indices (int) and topk values (float).
+  • Deterministic tie-break (pick lower index on equal scores).
+  • A single-thread or single-block O(n\_experts·k) implementation is fine.
+
+* Softmax over top-k: copy the selected k values into the predeclared top-k buffer and call your softmax (length = k) to turn them into probabilities, in place.
+
+* Wrap the above into a host helper (e.g., do\_ffn\_norm\_and\_route(layer, Config\*)) that:
+
+  1. runs RMSNorm to produce t,
+  2. computes router\_score,
+  3. runs top-k selection to fill d\_topk\_i and d\_topk\_v,
+  4. applies softmax on d\_topk\_v.
+
+* Default stream; CEIL\_DIV for launches where applicable; HIP\_CHECK after each launch/copy. Keep math/order identical to CPU.
+
+Prompt 13 — MoE MLP using BF16-stored weights
+
+Edit getp\_run.cpp only. Implement the per-token MoE MLP on device, mirroring run.cpp exactly. Tasks:
+
+* Zero the expert accumulator buffer (e\_agg) on device.
+
+* For each selected expert in top-k (indices + probs already in device buffers):
+  • MLP1: y1 = W\_mlp1\[layer, expert] (BF16) @ t + b\_mlp1\[layer, expert] (FP32) using your BF16→FP32 GEMV+bias.
+  • Split y1 into two halves (gate, up) exactly as run.cpp (first half vs second half).
+  • Apply SwiGLU exactly like run.cpp (same alpha, same clamping to ±limit, same “+1.0” adjustment to the up branch if present). FP32 only.
+  • Elementwise multiply to form gate\_up.
+  • MLP2: y2 = W\_mlp2\[layer, expert] (BF16) @ gate\_up + b\_mlp2\[layer, expert] (FP32) with your BF16→FP32 GEMV+bias.
+  • Accumulate into e\_agg with expert probability: e\_agg\[i] += p\_expert \* y2\[i] (simple 1D kernel).
+
+* After processing all k experts, add the residual for FFN: x += e\_agg (reuse your residual add kernel).
+
+* Compute layer/expert weight offsets exactly from the known shapes (no reorders):
+  W\_mlp1: \[2\*intermediate\_dim, hidden\_dim] per (layer, expert);
+  W\_mlp2: \[hidden\_dim, intermediate\_dim] per (layer, expert).
+  Bias shapes match their outputs. Use strict row-major indexing and the same contiguous layout as run.cpp.
+
+* Provide small 1D kernels (CEIL\_DIV, blockDim=256) for: split (gate/up), SwiGLU (+clamp), elementwise multiply to gate\_up, scaled accumulate into e\_agg, and final residual add call. Default stream; HIP\_CHECK after all launches/copies. No fast-math, keep arithmetic/order identical to CPU.
+
+Prompt 14 — Final RMSNorm → logits projection → copy logits to host
+
+Edit getp\_run.cpp only. Implement the final stage exactly as run.cpp. Tasks:
+
+* Final RMSNorm: on device, compute t\_final = RMSNorm(x, rms\_out\_w\[layer-independent]) in FP32 using your rmsnorm launcher. No fusing.
+
+* Logits projection: on device, compute logits\_dev = W\_out @ t\_final using your FP32 GEMV (follow run.cpp: if there’s no bias in run.cpp, don’t add one).
+
+* Host copy: ensure there is a host-visible logits buffer sized to vocab\_size (prefer pinned via hipHostMalloc). If not allocated yet, allocate lazily now; also ensure finish() frees it with hipHostFree and nulls it.
+
+* Copy logits\_dev → logits\_host each step (hipMemcpyDtoH). Add HIP\_CHECK. Default stream.
+
+* Wrap the above into a small host helper (e.g., do\_final\_logits(Config\*)) that:
+
+  1. runs final rmsnorm on x → t,
+  2. runs logits GEMV on device,
+  3. copies logits to the host buffer,
+  4. returns the host pointer for sampling.
+
+* Keep math/order identical to CPU; FP32 throughout; no fast-math; no changes elsewhere.
+
+Prompt 15 — Complete forward pass integration (forward\_hip)
+
+Edit getp\_run.cpp only. Replace the body of forward\_hip(Transformer\* transformer, int token, int pos) with a correctness-first GPU pipeline that calls the helpers you already added. Tasks:
+
+* Add a tiny embedding gather kernel+launcher if missing: copy the row for token from d\_token\_embedding\_table\_fp32 into d\_x (1D kernel, x\[i] = table\[token\*hidden\_dim + i]). Default stream, HIP\_CHECK.
+
+* In forward\_hip:
+
+  1. Embedding: launch the gather to fill d\_x for the current token id.
+  2. For layer = 0..n\_layers-1 (exact order as run.cpp):
+     • Attention pre-norm: t = RMSNorm(x, rms\_attn\_w\[layer]) via launch\_rmsnorm\_fp32.
+     • QKV: do\_qkv\_qkvproj\_split(layer, pos, d\_t, \&config).
+     • RoPE + commit K: do\_rope\_and\_commit\_k(layer, pos, \&config).
+     • Attention core: do\_attention\_layer(layer, pos, \&config).
+     • Output + residual: do\_attn\_out\_and\_residual(layer, \&config).
+     • FFN pre-norm + router: do\_ffn\_norm\_and\_route(layer, \&config).
+     • MoE MLP (BF16 weights): do\_moe\_expert\_mlp(layer, \&config).
+  3. Final: float\* logits\_host = do\_final\_logits(\&config); return logits\_host.
+
+* Keep all math FP32, no fast-math. Only device↔host copy should be the final logits (and the small D2H reads for expert index/weight already implemented). Default stream everywhere; HIP\_CHECK after each launch/copy.
+
+* Do not modify sampling/inference code; forward\_hip must only return the host logits pointer.
+
+
+
+
+
+
+
+
+
+Great idea. Here are small, sequential prompts (in English) you can paste to Claude Code one by one. Each prompt is narrow, correctness‑first, and reminds it to touch only getp\_run.cpp.
+
+Prompt 1 — Scope + Rules
+You are a senior GPU engineer (ROCm/HIP on AMD MI250). I’m porting “getp” mode to a correctness‑first HIP baseline. Follow these hard rules for the whole session:
+
+* Edit getp\_run.cpp only. Do NOT add new files or headers.
+* Keep CLI and evaluation flow unchanged. Sampling stays on CPU.
+* Use HIP only (hip/hip\_runtime.h). No rocBLAS/MIOpen.
+* Numerics: compute FP32 everywhere. Store only MoE MLP weights (w\_mlp1, w\_mlp2) in BF16 on device; all other weights FP32. When multiplying with BF16 weights, load BF16, upcast to FP32, and accumulate in FP32.
+  Acknowledge these rules and restate them in your own words so we’re aligned.
+
+Prompt 2 — Minimal HIP scaffolding in getp\_run.cpp
+Open getp\_run.cpp and add minimal HIP scaffolding:
+
+* Include hip/hip\_runtime.h.
+* Define HIP\_CHECK macro.
+* Define bf16 type (uint16\_t) plus f32\_to\_bf16 and bf16\_to\_f32 helpers (host+device).
+* Create a DeviceState struct holding device pointers for: all model weights (FP32 except w\_mlp1/w\_mlp2 as BF16), activations (x, t, tb, tb2, qkv, q, att, logits), and KV caches (key\_cache, value\_cache as FP32).
+  Return the exact DeviceState definition and the helpers, with no other behavior changes.
+
+Prompt 3 — Warmup() allocations and weight upload
+Implement warm\_up(Transformer\*, Tokenizer\*) in getp\_run.cpp:
+
+* hipMalloc all DeviceState buffers based on Config sizes.
+* Upload weights from TransformerWeights: FP32 weights copied as FP32; for w\_mlp1/w\_mlp2, convert host FP32 to device BF16 during upload (kernel or temporary pass) and store as BF16.
+* Zero KV caches and working buffers.
+* Do not change inference() yet.
+  Provide the full warm\_up implementation and any static upload kernels inside getp\_run.cpp.
+
+Prompt 4 — finish(): teardown
+Implement finish(Transformer\*, Tokenizer\*) that hipFree’s every device allocation in DeviceState, sets pointers to nullptr, and is idempotent (safe on repeated calls). Return the complete function.
+
+Prompt 5 — FP32 building‑block kernels: rmsnorm and softmax
+Add simple, correctness‑first HIP kernels in getp\_run.cpp:
+
+* rmsnorm(o, x, weight, size) with FP32 reductions, epsilon 1e‑5, identical math order to CPU.
+* softmax(x, size) with max subtraction for stability.
+  Also add thin host wrappers that launch 1D grids. No fusing or re‑association. Return kernel + wrappers.
+
+Prompt 6 — Matmul (GEMV) kernels: FP32 path
+Implement baseline FP32 GEMV kernel W\[out,in] @ x\[in] → y\[out] with exact row‑major indexing matching run.cpp matmul. One thread per output row is fine for now. Provide kernel + wrapper with signature: matmul\_fp32(y, x, W, in\_features, out\_features).
+
+Prompt 7 — Matmul (GEMV) kernels: BF16→FP32 path for MoE
+Add a second GEMV for MoE that reads device BF16 weights and multiplies against FP32 activations: matmul\_bf16\_fp32(y, x\_fp32, W\_bf16, in\_features, out\_features). Each multiply loads BF16, upcasts to float, accumulates in float. Return kernel + wrapper.
+
+Prompt 8 — QKV projection + bias + split + KV write
+Implement the QKV step on device inside forward\_hip:
+
+* y\_qkv = W\_qkv \* t + b\_qkv (FP32 GEMV).
+* Split y\_qkv into q (n\_attn\_heads*head\_dim), k (n\_kv\_heads*head\_dim), v (n\_kv\_heads\*head\_dim).
+* Write k,v for this layer/pos into device KV cache.
+  Return the modified forward\_hip segment and any small helpers you add, still in getp\_run.cpp.
+
+Prompt 9 — RoPE helpers and application
+Implement device or host‑precomputed helpers to match run.cpp’s compute\_cos\_sin and apply\_rotary\_emb math exactly (including YaRN/NTK scaling). Apply to q and k on device. Keep numeric order identical to CPU. Provide code changes in getp\_run.cpp only.
+
+Prompt 10 — Attention: scores, mask, sink, softmax, value mix
+Implement the attention compute on device for one layer/pos:
+
+* For each head h, compute scores = q·K\_cache\[0..pos]/sqrt(head\_dim).
+* If sliding\_window>0 and layer%2==0, add mask\[pos, t] exactly like CPU.
+* Append attention sink score for index pos+1 from attn\_sinks.
+* softmax over length (pos+2).
+* Weighted sum over V\_cache → head output tb\[h].
+  Return the device kernels and host launches; keep buffers and shapes identical to CPU.
+
+Prompt 11 — Attention output projection + residual
+Implement W\_o \* tb + b\_o on device (FP32 GEMV), then residual add back into x on device. Return code changes.
+
+Prompt 12 — FFN rmsnorm + Router top‑k on device
+On device:
+
+* rmsnorm to produce t for FFN.
+* router\_score = W\_router \* t + b\_router (FP32 GEMV).
+* Implement a simple device top‑k (experts\_per\_token) returning values and indices; then softmax the top‑k values on device.
+  Return kernels + launches. Keep logic parity with CPU.
+
+Prompt 13 — MoE MLP using BF16‑stored weights
+For each selected expert e (top‑k only):
+
+* mlp1\_out = W\_mlp1[e](BF16) \* t(FP32) + b\_mlp1\[e] → split into gate, up.
+* SwiGLU with alpha 1.702, clamping exactly like CPU (±swiglu\_limit), add +1.0 to up, elementwise multiply gate\_up.
+* y = W\_mlp2[e](BF16) \* gate\_up(FP32) + b\_mlp2\[e].
+* Accumulate weighted sum into e\_agg with router softmax weight.
+  Apply device residual add: x += e\_agg. Provide full code.
+
+Prompt 14 — Final rmsnorm + logits projection, copy logits to host
+Implement on device:
+
+* rmsnorm(x, x, rms\_out\_w).
+* logits = W\_out \* x (FP32 GEMV).
+  Copy logits back to pinned host buffer each step. Return the code for this tail and the host copy.
+
+Prompt 15 — Wire forward\_hip() end‑to‑end
+Replace the CPU math inside forward\_hip() with calls to your device kernels in the correct order across all layers, using device KV caches. Ensure the function returns a host pointer to logits suitable for CPU sampling. Show the complete forward\_hip().
+
+Prompt 16 — Keep inference() structure; sampling on CPU
+Keep simple\_getp\_generate() and inference() structure intact, but ensure they call forward\_hip(), and that only logits are copied back each step. Do not modify sampler logic. Return the minimal edits in getp\_run.cpp.
+
+Prompt 17 — One‑shot parity check (optional but recommended)
+Add a debug block that, for the first request and first position only, also calls the CPU forward() from run.cpp, compares GPU logits vs CPU logits on host, and prints max abs/rel diff (expect \~1e‑4). Gate this with an env var so it runs once. Return the parity code snippet.
+
+Prompt 18 — Build/run notes and MI250 arch
+Tell me any hipcc flags or defines you need (without editing Makefile), how to select MI250 arch (gfx90a), and any environment variables I should set. Do not change the CLI.
+
+Prompt 19 — Minimal tests for kernels
+Add tiny unit tests inside getp\_run.cpp (guarded by a TESTING macro block I can toggle) for rmsnorm, softmax, matmul\_fp32, matmul\_bf16\_fp32 with small shapes that compare vs CPU helpers. Return the guarded test code.
+
+Prompt 20 — Memory sanity print
+Add a warm\_up() print that estimates total device bytes used for weights (split by FP32 vs BF16) and KV cache, so I can verify 20B fits < 64 GB on MI250. Return the printf block and the math you used.
+
+These prompts reference getp\_run.cpp and run.cpp in my repo; keep all changes confined to getp\_run.cpp. &#x20;

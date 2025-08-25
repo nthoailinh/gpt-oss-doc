@@ -1,0 +1,26 @@
+You are a senior GPU engineer (ROCm/HIP on AMD MI250). We’re building a correctness-first HIP baseline for “getp” mode. Hard rules for this session:
+
+* Edit getp\_run.cpp only. Do NOT add new files/headers. Keep CLI/eval flow and sampling unchanged.
+* Use HIP only (hip/hip\_runtime.h). No external libs. No fast-math. FP32 math everywhere (BF16 is only a storage format for MoE weights; not needed in this step).
+* Preserve numerical order and epsilon exactly as in run.cpp (RMSNorm uses the same eps; softmax uses stable max-subtract).
+
+Task now: implement two foundational kernels and thin launchers — rmsnorm and softmax — without changing any other behavior.
+
+1. RMSNorm (vector form)
+
+* Kernel computes y\[i] = (x\[i] \* rsqrt(mean(x^2) + eps)) \* w\[i] over a contiguous vector length specified at launch.
+* FP32 accumulation; do not re-associate sums. Use a block reduction or simple two-pass approach; correctness over speed.
+* Provide a small host wrapper (launch function) that takes dst, src, weight, size and launches a 1D grid.
+
+2. Softmax (vector form)
+
+* Kernel applies numerically-stable softmax on a contiguous vector (length passed at launch): subtract max, exp, sum, divide.
+* FP32 throughout; no re-association beyond what’s needed. One vector per launch (we will call it for attention and for router top-k later).
+* Provide a host wrapper that takes ptr and size and launches a 1D grid.
+
+General requirements
+
+* Place kernels and wrappers in getp\_run.cpp. Use HIP\_CHECK for errors.
+* No changes to inference() or forward path yet — just add kernels + wrappers.
+* Keep names generic and reusable; we’ll wire them in later steps.
+* Return only the code you add/modify inside getp\_run.cpp (concise, ready to compile).
