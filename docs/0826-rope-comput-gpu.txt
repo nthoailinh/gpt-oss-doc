@@ -1,0 +1,60 @@
+⏺ Tuyệt vời! Refactor đã thành công. Tôi thấy vấn đề nghiêm trọng về RoPE bottleneck:
+
+  Phân tích bottleneck:
+
+  rope_copy_to_device chiếm 64.92% (220s/338s) - đây là vấn đề lớn nhất!
+
+  Tại sao cần rope_copy_to_device?
+
+  Hiện tại code tính cos/sin trên CPU rồi copy sang GPU mỗi forward pass:
+  // CPU compute (getp_run.cpp:1280-1286)
+  compute_cos_sin(pos, p->rope_theta, head_dim, ...);
+  // GPU copy (1290-1291) 
+  HIP_CHECK(hipMemcpy(d_cos, cos_vals.data(), ...));
+  HIP_CHECK(hipMemcpy(d_sin, sin_vals.data(), ...));
+
+  Tại sao chậm?
+
+  - 24,576 lần copy (24 layers × 1024 tokens)
+  - Mỗi copy: head_dim/2 * sizeof(float) = ~256 bytes
+  - PCIe bandwidth overhead cho transfers nhỏ
+  - CPU-GPU sync barrier
+
+  Giải pháp tối ưu:
+
+  1. GPU RoPE kernel (khuyến nghị)
+
+  Tính cos/sin trực tiếp trên GPU:
+
+  __global__ void compute_rope_coords_kernel(float* cos_out, float* sin_out, 
+      int pos, float theta, int head_dim, float rope_scaling_factor) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int half_dim = head_dim / 2;
+
+    if (tid < half_dim) {
+      float freq = 1.0f / powf(theta, (float)(2 * tid) / head_dim);
+      freq *= rope_scaling_factor;
+      float angle = pos * freq;
+      cos_out[tid] = cosf(angle);
+      sin_out[tid] = sinf(angle);
+    }
+  }
+
+  2. Fused RoPE kernel
+
+  Tốt nhất: tích hợp cos/sin compute vào apply_rotary_emb_kernel:
+
+  __global__ void fused_rope_kernel(float* x, int pos, float theta, 
+      int n_heads, int head_dim, float rope_scaling_factor) {
+    // Compute freq on-the-fly
+    // Apply rotation directly
+  }
+
+  3. Pre-compute và cache
+
+  Nếu giữ CPU approach:
+  - Pre-compute cos/sin cho tất cả positions trong warm_up
+  - Cache trên GPU, index theo pos
+
+  Bạn muốn tôi implement giải pháp nào? Fused RoPE kernel sẽ cho performance tốt nhất vì loại bỏ hoàn
+  toàn memory transfers và intermediate storage.

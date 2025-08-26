@@ -1,0 +1,33 @@
+⏺ Summary của tối ưu hóa Softmax cho MI250:
+
+  Thay đổi chính:
+
+  1. Parallel Reduction Architecture:
+    - Thay thế single-threaded softmax bằng parallel reduction
+    - Sử dụng 256 threads/block (4 wavefronts × 64 threads) tối ưu cho MI250
+    - Unrolled reduction loops cho hiệu suất tối đa
+  2. Batch Processing:
+    - launch_softmax_batch() xử lý tất cả attention heads cùng lúc
+    - Mỗi block xử lý 1 head → n_heads blocks chạy song song
+    - Giảm kernel launch overhead từ n_heads lần xuống 1 lần
+  3. Memory Optimization:
+    - Shared memory cho parallel reduction
+    - Volatile pointers cho warp-level operations
+    - Coalesced memory access patterns
+  4. Precision Maintenance:
+    - Giữ nguyên double precision cho max/sum computation
+    - Đảm bảo numerical parity với CPU baseline
+    - RNE rounding consistency
+
+  Expected Performance Improvements:
+
+  - Parallel Execution: Thay vì 1 thread làm việc, 256 threads song song
+  - Batch Processing: Giảm từ ~32 kernel launches xuống 1 launch/layer
+  - Reduced Synchronization: Ít hipDeviceSynchronize() calls
+  - Better GPU Utilization: Tận dụng tối đa CUs của MI250
+
+  Theoretical Speedup:
+
+  - Single softmax: ~10-20x speedup (256 threads vs 1 thread)
+  - Batch processing: ~30x speedup (1 launch vs 32 launches)
+  - Overall expected: 5-10x improvement trong attention_softmax timing

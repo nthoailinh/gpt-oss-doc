@@ -1,0 +1,91 @@
+⏺ Về Matrix Core optimization và quy định thư viện mới:
+
+  Ma trận Cores trên AMD MI250:
+
+  Được phép:
+
+  ✅ Native HIP Matrix Instructions - Đây là part của HIP runtime:
+  // WMMA (Wave Matrix Multiply Accumulate) instructions
+  __device__ void wmma_f16_f16_f16(...);
+  __device__ void wmma_bf16_bf16_f32(...);
+  // Inline assembly cho MFMA instructions
+  asm volatile("v_mfma_f32_32x32x8f16 ..." : ...);
+
+  ✅ Manual MFMA Assembly - Direct hardware instructions:
+  // AMD CDNA2 MFMA instructions
+  __device__ inline void mfma_32x32x8_f16(...) {
+    asm volatile(
+      "v_mfma_f32_32x32x8f16 %0, %1, %2, %3"
+      : "=v"(output) : "v"(a), "v"(b), "v"(c)
+    );
+  }
+
+  KHÔNG được phép:
+
+  ❌ rocBLAS - 3rd party library❌ hipBLAS - Wrapper around rocBLAS❌ rocWMMA - High-level matrix
+  library❌ Tensile - AMD's tensor library
+
+  Implementation Strategy cho Matrix Cores:
+
+  1. Direct MFMA Instructions (Khuyến nghị):
+
+  // Trong kernels.hip
+  __global__ void matmul_mfma_kernel(
+      float* C, const __half* A, const __half* B, 
+      int M, int N, int K) {
+
+    // Sử dụng MFMA 32x32x8 instruction trực tiếp
+    __half a_frag[8], b_frag[8];
+    float c_frag[32];
+
+    // Load fragments
+    // ...
+
+    // MFMA instruction
+    asm volatile(
+      "v_mfma_f32_32x32x8f16 %0, %1, %2, %3"
+      : "+v"(c_frag[0]), "+v"(c_frag[1]) // ... 32 outputs
+      : "v"(a_frag[0]), "v"(b_frag[0])   // inputs
+    );
+  }
+
+  2. HIP Intrinsics (Nếu available):
+
+  // Check if HIP provides WMMA intrinsics
+  #ifdef __HIP_DEVICE_COMPILE__
+    // Use HIP matrix intrinsics if available
+    wmma::fragment<wmma::matrix_a, 32, 32, 8, __half> a_frag;
+    wmma::fragment<wmma::matrix_b, 32, 32, 8, __half> b_frag;
+    wmma::fragment<wmma::accumulator, 32, 32, 8, float> c_frag;
+  #endif
+
+  3. Applications for Your Code:
+
+  1. MatMul kernels (matmul_fp32_kernel, matmul_bf16_kernel)
+  2. Attention QK^T computation
+  3. MLP1/MLP2 trong MoE experts
+
+  Practical Next Steps:
+
+  1. Verify HIP Matrix Support:
+  # Check HIP version và matrix capabilities
+  /opt/rocm/bin/rocm-info | grep -i matrix
+
+  2. Start Simple:
+  // Replace current matmul with MFMA version
+  __global__ void matmul_mfma_fp16_kernel(...) {
+    // 32x32 tiles with MFMA instructions
+  }
+
+  3. Major Performance Gains Expected:
+  - MatMul: 5-10x improvement từ tensor cores
+  - MoE MLPs: Huge gains do intensive GEMM operations
+  - Attention scores: QK^T multiplication acceleration
+
+  Compliance Check:
+
+  ✅ Matrix cores via inline assembly: Legal (part of ISA)✅ Native HIP instructions: Legal (part of
+  HIP runtime)❌ External BLAS libraries: Illegal
+
+  Tóm lại: Matrix core optimization HOÀN TOÀN khả thi với quy định mới, nhưng cần implement manual
+  assembly thay vì dùng high-level libraries!
