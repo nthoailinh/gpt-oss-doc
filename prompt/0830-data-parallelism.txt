@@ -1,0 +1,82 @@
+# Multi-GPU Data Parallel Implementation for gpt-oss Inference
+
+## Context
+I'm working on a high-performance inference system for gpt-oss (20B/120B parameter models) based on llama2.c. The project uses AMD MI250 GPUs with HIP/ROCm and needs to implement Data Parallelism for the `getp` mode (multiple independent inference requests).
+
+## Current Codebase Structure
+- **Base**: CPU-only C/C++ inference in `run.cpp` (DO NOT MODIFY)
+- **Extension point**: `getp_run.cpp` where I can add GPU implementation
+- **Evaluation**: `getp_eval.cpp` handles I/O (DO NOT MODIFY)
+- **Hardware**: Up to 8× AMD MI250 GPUs, single-node only
+- **Constraint**: Write all GPU kernels from scratch using HIP (no rocBLAS/cuBLAS)
+
+## Files Structure
+```
+├── getp_eval.cpp           # I/O handling (DO NOT MODIFY) 
+├── getp_run.cpp           # My extension point
+└── [NEW FILES NEEDED]     # GPU kernels, memory management
+```
+
+## Current Flow (CPU-only)
+```cpp
+void getp() {
+    // 1. read_inputfile() -> load multiple requests
+    // 2. warm_up() -> currently empty
+    // 3. inference() -> process each request sequentially on CPU
+    // 4. write_outputfile() -> save token outputs
+    // 5. finish() -> currently empty
+}
+```
+
+## Data Parallel Strategy
+**Objective**: Distribute N requests across 8 GPUs, each GPU processes N/8 requests independently.
+
+**Key insight**: `getp` mode has independent requests - perfect for data parallelism without inter-GPU communication during inference.
+
+## Implementation Requirements
+
+### 1. GPU Memory Management
+```cpp
+// Need to implement in new files:
+- Model weight loading to each GPU (broadcast same weights)
+- KV-cache allocation per GPU 
+- Request batching per GPU
+- Result aggregation
+```
+
+### 2. HIP Kernel Requirements
+Write from scratch (no libraries):
+- **Matrix multiplication** (GEMM) kernels for attention/MLP
+- **Layer normalization** kernels  
+- **Attention** kernels (QKV projection, softmax, output)
+- **MoE routing** kernels (topk selection, expert gating)
+- **Activation functions** (SwiGLU, etc.)
+
+## What I Need You to Implement
+
+### Phase 1: Core Multi-GPU Infrastructure
+1. **GPU initialization**: Initialize 8 AMD MI250 GPUs using HIP
+2. **Model replication**: Load same model weights to all GPUs  
+3. **Request distribution**: Split requests across GPUs evenly
+4. **Memory management**: Allocate GPU memory for model + activations + KV-cache
+
+### Phase 2: Essential HIP Kernels  
+1. **GEMM kernel**: Core matrix multiplication (most critical)
+2. **Layer norm kernel**: RMS normalization 
+3. **Attention kernel**: Multi-head attention with RoPE
+4. **Activation kernels**: SwiGLU for MLP
+
+### Phase 3: Integration
+1. **Modify getp_run.cpp** to use GPU implementation
+2. **Performance measurement**: Tokens/sec throughput
+3. **Correctness verification**: Compare GPU vs CPU outputs
+
+## Compilation Integration
+I cannot run this code locally because it requires the MI250 GPU server environment. I will run it on the server and then share the results with you afterward.
+
+## Performance Goals
+- **Target**: 8x speedup over single CPU (linear scaling)
+- **Memory**: Efficient GPU memory usage (avoid CPU↔GPU transfers during inference)
+- **Throughput**: Maximize tokens/sec for batch inference
+
+Please start with **Phase 1** and provide complete, compilable code with detailed explanations of the data parallel strategy.
